@@ -42,8 +42,11 @@ def parse_exams(data: list) -> list:
             department=e.get("department", ""),
             requires_computer=e.get("requires_computer", False),
             priority=e.get("priority", 0),
-            # Laravel-specific: carry instructor_id through
             instructor_id=e.get("instructor_id", None),
+            exam_type=e.get("exam_type", "written"),
+            instructor_prefs=e.get("instructor_prefs", {}),
+            group_id=e.get("group_id", ""),
+            section_id=str(e.get("section_id", "")),
         ))
     return exams
 
@@ -51,12 +54,15 @@ def parse_exams(data: list) -> list:
 def parse_rooms(data: list) -> list:
     rooms = []
     for r in data:
+        # Determine room_type: use explicit value, or fall back to has_computers flag
+        room_type = r.get("room_type", "lab" if r.get("has_computers", False) else "lec")
         rooms.append(Room(
             id=str(r["id"]),
             name=r.get("name", str(r["id"])),
             capacity=r.get("capacity", 50),
             has_computers=r.get("has_computers", False),
             building=r.get("building", ""),
+            room_type=room_type,
         ))
     return rooms
 
@@ -91,8 +97,9 @@ def format_schedule_laravel(schedule, exams_dict, rooms_dict, slots_dict):
         exam = exams_dict[a.exam_id]
 
         result.append({
-            # IDs for Laravel to save
-            "subject_id": int(a.exam_id),
+            # IDs for Laravel to save — subject_id is the composite "5_12"
+            # Laravel post-processes this to extract real subject_id and section_id
+            "subject_id": a.exam_id,
             "room_id": int(a.room_id),
             "instructor_id": getattr(exam, 'instructor_id', None),
 

@@ -25,6 +25,10 @@ class Exam:
     requires_computer: bool = False
     priority: int = 0
     instructor_id: Optional[int] = None  # Laravel user_id
+    exam_type: str = "written"            # 'written' or 'hands-on'
+    instructor_prefs: dict = field(default_factory=dict)  # {'days': [0,1], 'shifts': ['morning']}
+    group_id: str = ""    # Links sections of the same subject (e.g. "subj_5")
+    section_id: str = ""  # The specific section this exam represents
 
 
 @dataclass
@@ -34,6 +38,7 @@ class Room:
     capacity: int
     has_computers: bool = False
     building: str = ""
+    room_type: str = "lec"  # 'lec' or 'lab'
 
 
 @dataclass
@@ -46,7 +51,29 @@ class Timeslot:
     date_str: str = ""  # Actual date string from Laravel (e.g. "2026-04-01")
 
     @property
+    def end_time_minutes(self) -> int:
+        """Calculate the ending time in total minutes from midnight."""
+        return (self.start_hour * 60) + self.start_minute + self.duration_minutes
+
+    @property
+    def shift_name(self) -> str:
+        """
+        Determine which shift this timeslot belongs to:
+          - Starts before 12:00 → 'morning'
+          - Starts 12:00 to 16:59 → 'afternoon'
+          - Starts 17:00 or later → 'evening'
+        """
+        start = self.start_hour * 60 + self.start_minute
+        if start < 720:      # before 12:00
+            return "morning"
+        elif start < 1020:   # before 17:00
+            return "afternoon"
+        else:
+            return "evening"
+
+    @property
     def day_name(self) -> str:
+        """Return the short weekday name for this timeslot's day."""
         return ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][self.day]
 
     def overlaps(self, other: "Timeslot") -> bool:
@@ -117,6 +144,13 @@ class ConstraintEngine:
             if exam.instructor_id:
                 iid = str(exam.instructor_id)
                 self.instructor_map.setdefault(iid, []).append(eid)
+
+        # Pre-compute group map (sections of the same subject)
+        # group_id → [exam_ids] — used by same-timeslot and different-room constraints
+        self.group_map: Dict[str, List[str]] = {}
+        for eid, exam in exams.items():
+            if exam.group_id:
+                self.group_map.setdefault(exam.group_id, []).append(eid)
 
     # ── Hard Constraints ──────────────────────────────────────────────────
 
@@ -189,22 +223,37 @@ class ConstraintEngine:
                 ))
         return violations
 
-    def _check_computer_requirement(self, schedule):
+    def _check_exam_room_type_match(self, schedule):
+        """
+        HC4: Exam type must match room type.
+        'hands-on' exams can ONLY go in 'lab' rooms.
+        'written' exams can ONLY go in 'lec' rooms.
+        This replaces the old _check_computer_requirement method.
+        """
         violations = []
         for a in schedule:
             exam = self.exams[a.exam_id]
             room = self.rooms[a.room_id]
-            if exam.requires_computer and not room.has_computers:
+            if exam.exam_type == 'hands-on' and room.room_type != 'lab':
                 violations.append(ConstraintViolation(
-                    "computer_room", ConstraintType.HARD,
+                    "exam_room_type", ConstraintType.HARD,
                     self.HARD_PENALTY,
-                    f"Exam {a.exam_id} needs computers but room {a.room_id} has none",
+                    f"Hands-on exam {a.exam_id} placed in non-lab room {a.room_id}",
+                    exam_ids=[a.exam_id],
+                ))
+            elif exam.exam_type == 'written' and room.room_type != 'lec':
+                violations.append(ConstraintViolation(
+                    "exam_room_type", ConstraintType.HARD,
+                    self.HARD_PENALTY,
+                    f"Written exam {a.exam_id} placed in lab room {a.room_id}",
                     exam_ids=[a.exam_id],
                 ))
         return violations
 
     def _check_instructor_clash(self, schedule):
-        """HC5: No instructor has two exams in overlapping timeslots."""
+        """HC5: No instructor has two exams in overlapping timeslots.
+        Exception: sections of the same subject (same group_id) are EXPECTED
+        to share a timeslot since one instructor handles all sections."""
         violations = []
         # Build instructor → [(exam_id, timeslot_id)] map from the schedule
         instructor_schedule = {}
@@ -217,6 +266,11 @@ class ConstraintEngine:
         for iid, assignments in instructor_schedule.items():
             for i in range(len(assignments)):
                 for j in range(i + 1, len(assignments)):
+                    # Skip if both exams belong to the same group (same subject sections)
+                    exam_i = self.exams[assignments[i].exam_id]
+                    exam_j = self.exams[assignments[j].exam_id]
+                    if exam_i.group_id and exam_i.group_id == exam_j.group_id:
+                        continue
                     ts_i = self.timeslots[assignments[i].timeslot_id]
                     ts_j = self.timeslots[assignments[j].timeslot_id]
                     if ts_i.overlaps(ts_j):
@@ -228,7 +282,60 @@ class ConstraintEngine:
                         ))
         return violations
 
+    def _check_section_same_timeslot(self, schedule):
+        """
+        HC6: All sections of the same subject (same group_id) MUST share
+        the exact same timeslot. This is a hard constraint — if Section A
+        of Math 101 is at 9:30 AM Monday, Section B must also be at 9:30 AM Monday.
+        """
+        violations = []
+        # Build exam → timeslot lookup from the schedule
+        exam_ts = {a.exam_id: a.timeslot_id for a in schedule}
+
+        for gid, eids in self.group_map.items():
+            if len(eids) <= 1:
+                continue  # single section, nothing to check
+            # Get the timeslot for each exam in this group
+            timeslots_used = set()
+            for eid in eids:
+                if eid in exam_ts:
+                    timeslots_used.add(exam_ts[eid])
+            if len(timeslots_used) > 1:
+                violations.append(ConstraintViolation(
+                    "section_same_timeslot", ConstraintType.HARD,
+                    self.HARD_PENALTY * (len(timeslots_used) - 1),
+                    f"Group {gid}: sections are in {len(timeslots_used)} different timeslots (must be 1)",
+                    exam_ids=eids,
+                ))
+        return violations
+
     # ── Soft Constraints ──────────────────────────────────────────────────
+
+    def _check_section_different_rooms(self, schedule):
+        """
+        SC: Sections of the same subject SHOULD be in different rooms.
+        If two sections share the same room and timeslot, penalize lightly.
+        """
+        violations = []
+        exam_assignment = {a.exam_id: a for a in schedule}
+
+        for gid, eids in self.group_map.items():
+            if len(eids) <= 1:
+                continue
+            rooms_used = []
+            for eid in eids:
+                if eid in exam_assignment:
+                    rooms_used.append(exam_assignment[eid].room_id)
+            # Check for duplicate rooms within same group
+            if len(rooms_used) != len(set(rooms_used)):
+                duplicates = len(rooms_used) - len(set(rooms_used))
+                violations.append(ConstraintViolation(
+                    "section_same_room", ConstraintType.SOFT,
+                    30 * duplicates,
+                    f"Group {gid}: {duplicates} section pair(s) share the same room",
+                    exam_ids=eids,
+                ))
+        return violations
 
     def _check_consecutive_exams(self, schedule):
         violations = []
@@ -290,7 +397,45 @@ class ConstraintEngine:
             ))
         return violations
 
-    # ── Main Evaluation ───────────────────────────────────────────────────
+    def _check_instructor_preferences(self, schedule):
+        """
+        SC4: Instructor time preferences (soft constraint).
+
+        If an exam's instructor has set preferred days and/or shifts,
+        apply a minor penalty (+20 per mismatch) when the scheduled
+        timeslot falls outside those preferences.
+        The algorithm will TRY to respect them but will not fail if
+        the preferred slots are full.
+        """
+        violations = []
+        penalty_total = 0
+        for a in schedule:
+            exam = self.exams[a.exam_id]
+            prefs = exam.instructor_prefs
+            if not prefs:
+                continue
+
+            ts = self.timeslots[a.timeslot_id]
+            pref_days = prefs.get('days', [])
+            pref_shifts = prefs.get('shifts', [])
+
+            # Check day preference
+            if pref_days and ts.day not in pref_days:
+                penalty_total += 20
+
+            # Check shift preference
+            if pref_shifts and ts.shift_name not in pref_shifts:
+                penalty_total += 20
+
+        if penalty_total > 0:
+            violations.append(ConstraintViolation(
+                "instructor_preferences", ConstraintType.SOFT,
+                penalty_total,
+                f"Instructor preference mismatches: {penalty_total // 20} violations"
+            ))
+        return violations
+
+    # ── Main Evaluation ───────────────────────────────────────────────────────────
 
     def evaluate(self, schedule):
         all_violations = []
@@ -299,13 +444,16 @@ class ConstraintEngine:
         all_violations.extend(self._check_student_clash(schedule))
         all_violations.extend(self._check_room_clash(schedule))
         all_violations.extend(self._check_room_capacity(schedule))
-        all_violations.extend(self._check_computer_requirement(schedule))
+        all_violations.extend(self._check_exam_room_type_match(schedule))
         all_violations.extend(self._check_instructor_clash(schedule))
+        all_violations.extend(self._check_section_same_timeslot(schedule))
 
         # Soft
         all_violations.extend(self._check_consecutive_exams(schedule))
         all_violations.extend(self._check_spread(schedule))
         all_violations.extend(self._check_room_utilization(schedule))
+        all_violations.extend(self._check_instructor_preferences(schedule))
+        all_violations.extend(self._check_section_different_rooms(schedule))
 
         total_penalty = sum(v.penalty for v in all_violations)
         fitness = 10_000_000 - total_penalty

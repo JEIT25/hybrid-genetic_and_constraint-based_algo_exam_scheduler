@@ -84,15 +84,29 @@ class ExamSchedulerGA:
         self.engine = ConstraintEngine(self.exams, self.rooms, self.timeslots)
 
         # Pre-compute feasible (room, timeslot) pairs per exam
+        # Enforces three hard rules at the structural level:
+        #   1. Room capacity must be sufficient for the exam
+        #   2. Exam type must match room type (written->lec, hands-on->lab)
+        #   3. No exam can end after 7:30 PM (19:30 = 1170 minutes)
         self._feasible_pairs: Dict[str, List[Tuple[str, str]]] = {}
+        MAX_END_MINUTES = 1170  # 19 hours * 60 + 30 minutes = 7:30 PM
+
         for eid, exam in self.exams.items():
             pairs = []
             for rid, room in self.rooms.items():
+                # HC: Room capacity check
                 if exam.student_count > room.capacity:
                     continue
-                if exam.requires_computer and not room.has_computers:
+                # HC: Exam type ↔ room type strict matching
+                if exam.exam_type == 'hands-on' and room.room_type != 'lab':
                     continue
-                for tid in self.timeslots:
+                if exam.exam_type == 'written' and room.room_type != 'lec':
+                    continue
+                for tid, ts in self.timeslots.items():
+                    # HC: 7:30 PM rule — exam end time must not exceed 19:30
+                    end_minutes = (ts.start_hour * 60 + ts.start_minute) + exam.duration_minutes
+                    if end_minutes > MAX_END_MINUTES:
+                        continue
                     pairs.append((tid, rid))
             self._feasible_pairs[eid] = pairs if pairs else [
                 (tid, rid) for tid in self.timeslots for rid in self.rooms
