@@ -233,6 +233,7 @@ def create_schedule():
         mutation_rate=cfg_data.get("mutation_rate", 0.15),
         stagnation_limit=cfg_data.get("stagnation_limit", 50),
         seed=cfg_data.get("seed", None),
+        soft_weight=float(cfg_data.get("soft_weight", 1.0)),
     )
 
     job_id = str(uuid.uuid4())
@@ -287,6 +288,8 @@ def create_schedule_sync():
         mutation_rate=cfg_data.get("mutation_rate", 0.15),
         stagnation_limit=cfg_data.get("stagnation_limit", 40),
         seed=cfg_data.get("seed", None),
+        soft_weight=float(cfg_data.get("soft_weight", 1.0)),
+        max_repair_attempts=int(cfg_data.get("max_repair_attempts", 50)),
     )
 
     try:

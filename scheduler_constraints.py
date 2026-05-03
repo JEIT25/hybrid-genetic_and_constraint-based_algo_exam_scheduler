@@ -223,29 +223,45 @@ class ConstraintEngine:
                 ))
         return violations
 
+    # High soft penalty: strongly discourage wrong room type, but allow it
+    # as a last resort when no correct-type room is available.
+    ROOM_TYPE_MISMATCH_PENALTY = 500_000
+
     def _check_exam_room_type_match(self, schedule):
         """
-        HC4: Exam type must match room type.
-        'hands-on' exams can ONLY go in 'lab' rooms.
-        'written' exams can ONLY go in 'lec' rooms.
-        This replaces the old _check_computer_requirement method.
+        SC (high-penalty soft): Exam type should match room type.
+
+        - 'hands-on' exams strongly prefer 'lab' rooms.
+        - 'written'   exams strongly prefer 'lec' rooms.
+
+        This is a SOFT constraint so the algorithm can still produce a
+        valid (feasible) schedule when the ideal room type is unavailable,
+        rather than generating an unresolvable hard failure.  The penalty
+        is set high enough (500,000) that the GA will virtually never place
+        an exam in the wrong room type unless there is genuinely no alternative.
+
+        Both directions are penalised equally and flagged with the same
+        violation name so the UI can display them clearly.
         """
         violations = []
         for a in schedule:
             exam = self.exams[a.exam_id]
             room = self.rooms[a.room_id]
+
             if exam.exam_type == 'hands-on' and room.room_type != 'lab':
                 violations.append(ConstraintViolation(
-                    "exam_room_type", ConstraintType.HARD,
-                    self.HARD_PENALTY,
-                    f"Hands-on exam {a.exam_id} placed in non-lab room {a.room_id}",
+                    "room_type_mismatch", ConstraintType.SOFT,
+                    self.ROOM_TYPE_MISMATCH_PENALTY,
+                    f"Hands-on exam \"{exam.name}\" is in lecture room {room.name} "
+                    f"(no lab was available — this is a fallback placement)",
                     exam_ids=[a.exam_id],
                 ))
             elif exam.exam_type == 'written' and room.room_type != 'lec':
                 violations.append(ConstraintViolation(
-                    "exam_room_type", ConstraintType.HARD,
-                    self.HARD_PENALTY,
-                    f"Written exam {a.exam_id} placed in lab room {a.room_id}",
+                    "room_type_mismatch", ConstraintType.SOFT,
+                    self.ROOM_TYPE_MISMATCH_PENALTY,
+                    f"Written exam \"{exam.name}\" is in lab room {room.name} "
+                    f"(no lecture room was available — this is a fallback placement)",
                     exam_ids=[a.exam_id],
                 ))
         return violations
@@ -338,101 +354,151 @@ class ConstraintEngine:
         return violations
 
     def _check_consecutive_exams(self, schedule):
+        """Emit one violation per student who has back-to-back exams."""
         violations = []
         student_schedule = {}
         for a in schedule:
             exam = self.exams[a.exam_id]
             ts = self.timeslots[a.timeslot_id]
             for sid in exam.enrolled_students:
-                student_schedule.setdefault(sid, []).append((a.exam_id, ts))
+                student_schedule.setdefault(sid, []).append((a.exam_id, exam.name, ts))
 
-        consecutive_count = 0
         for sid, entries in student_schedule.items():
-            entries.sort(key=lambda x: (x[1].day, x[1].start_hour, x[1].start_minute))
+            entries.sort(key=lambda x: (x[2].day, x[2].start_hour, x[2].start_minute))
             for i in range(len(entries) - 1):
-                if entries[i][1].is_consecutive(entries[i + 1][1]):
-                    consecutive_count += 1
-
-        if consecutive_count > 0:
-            violations.append(ConstraintViolation(
-                "consecutive_exams", ConstraintType.SOFT,
-                50 * consecutive_count,
-                f"{consecutive_count} student-consecutive-exam pairs"
-            ))
+                if entries[i][2].is_consecutive(entries[i + 1][2]):
+                    e1, e2 = entries[i][1], entries[i + 1][1]
+                    violations.append(ConstraintViolation(
+                        "consecutive_exams_detail", ConstraintType.SOFT,
+                        50,
+                        f"Student #{sid} has back-to-back exams: {e1} then {e2} with no break",
+                    ))
         return violations
 
     def _check_spread(self, schedule):
+        """Emit one violation per day that is overloaded (above average exam count)."""
+        DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
         violations = []
-        day_counts = {}
+        day_counts  = {}
+        day_exams   = {}   # day -> [exam_name]
         for a in schedule:
-            day = self.timeslots[a.timeslot_id].day
+            day  = self.timeslots[a.timeslot_id].day
+            name = self.exams[a.exam_id].name
             day_counts[day] = day_counts.get(day, 0) + 1
+            day_exams.setdefault(day, []).append(name)
 
-        if day_counts:
-            counts = list(day_counts.values())
-            mean = sum(counts) / len(counts)
-            variance = sum((c - mean) ** 2 for c in counts) / len(counts)
-            penalty = variance * 10
-            if penalty > 0:
+        if not day_counts:
+            return violations
+
+        counts = list(day_counts.values())
+        mean   = sum(counts) / len(counts)
+
+        for day, count in day_counts.items():
+            if count > mean * 1.5 and count > 2:   # only flag notably overloaded days
+                day_name  = DAY_NAMES[day] if day < len(DAY_NAMES) else f"Day {day}"
+                exams_str = ", ".join(day_exams[day])
                 violations.append(ConstraintViolation(
-                    "uneven_spread", ConstraintType.SOFT, penalty,
-                    f"Day distribution variance: {variance:.1f}"
+                    "uneven_spread_detail", ConstraintType.SOFT,
+                    (count - mean) * 10,
+                    f"{day_name} is overloaded with {count} exams (avg {mean:.1f}): {exams_str}",
                 ))
         return violations
 
     def _check_room_utilization(self, schedule):
+        """
+        Emit one violation per exam assignment whose room has significant waste
+        (>= 5 empty seats).  This gives the admin a per-room, per-exam breakdown
+        rather than an opaque total.
+        """
         violations = []
-        total_waste = 0
         for a in schedule:
             exam = self.exams[a.exam_id]
             room = self.rooms[a.room_id]
             waste = room.capacity - exam.student_count
-            if waste > 0:
-                total_waste += waste
-        penalty = total_waste * 0.5
-        if penalty > 0:
-            violations.append(ConstraintViolation(
-                "room_waste", ConstraintType.SOFT, penalty,
-                f"Total wasted seats: {total_waste}"
-            ))
+            if waste >= 5:
+                violations.append(ConstraintViolation(
+                    "room_waste_detail", ConstraintType.SOFT,
+                    waste * 0.5,
+                    f"Room {room.name} (#{room.id}, cap {room.capacity}): "
+                    f"{exam.student_count} student(s) — {waste} seat(s) wasted "
+                    f"[{exam.name}]",
+                    exam_ids=[a.exam_id],
+                ))
         return violations
 
     def _check_instructor_preferences(self, schedule):
         """
         SC4: Instructor time preferences (soft constraint).
 
-        If an exam's instructor has set preferred days and/or shifts,
-        apply a minor penalty (+20 per mismatch) when the scheduled
-        timeslot falls outside those preferences.
-        The algorithm will TRY to respect them but will not fail if
-        the preferred slots are full.
+        Emits one ConstraintViolation per instructor per mismatch type
+        (day mismatch OR shift mismatch) so the frontend can display a
+        detailed, human-readable breakdown of which instructor preference
+        was violated and which exam caused it.
+
+        Penalty: +20 per individual mismatch.
         """
-        violations = []
-        penalty_total = 0
+        DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+        # instructor_id -> { 'day': [...], 'shift': [...] }
+        per_instructor: dict = {}
+
         for a in schedule:
             exam = self.exams[a.exam_id]
             prefs = exam.instructor_prefs
             if not prefs:
                 continue
 
+            iid = str(exam.instructor_id) if exam.instructor_id else None
+            if not iid:
+                continue
+
             ts = self.timeslots[a.timeslot_id]
-            pref_days = prefs.get('days', [])
-            pref_shifts = prefs.get('shifts', [])
+            # pref_days may arrive as strings ("0","1"…) or ints — normalise to int
+            raw_days    = prefs.get('days', [])
+            pref_days   = [int(d) for d in raw_days if str(d).lstrip('-').isdigit()]
+            pref_shifts = prefs.get('shifts', [])  # list of str like 'morning'
 
-            # Check day preference
+            bucket = per_instructor.setdefault(iid, {'day': [], 'shift': []})
+
             if pref_days and ts.day not in pref_days:
-                penalty_total += 20
+                pref_day_names = [DAY_NAMES[d] for d in pref_days if 0 <= d < len(DAY_NAMES)]
+                bucket['day'].append({
+                    'exam_name': exam.name,
+                    'scheduled_day': DAY_NAMES[ts.day] if 0 <= ts.day < len(DAY_NAMES) else str(ts.day),
+                    'preferred_days': pref_day_names,
+                })
 
-            # Check shift preference
             if pref_shifts and ts.shift_name not in pref_shifts:
-                penalty_total += 20
+                bucket['shift'].append({
+                    'exam_name': exam.name,
+                    'scheduled_shift': ts.shift_name,
+                    'preferred_shifts': pref_shifts,
+                })
 
-        if penalty_total > 0:
-            violations.append(ConstraintViolation(
-                "instructor_preferences", ConstraintType.SOFT,
-                penalty_total,
-                f"Instructor preference mismatches: {penalty_total // 20} violations"
-            ))
+        violations = []
+        for iid, mismatches in per_instructor.items():
+            if mismatches['day']:
+                count  = len(mismatches['day'])
+                exams  = ', '.join(m['exam_name'] for m in mismatches['day'])
+                sched  = ', '.join(m['scheduled_day'] for m in mismatches['day'])
+                prefs  = '/'.join(mismatches['day'][0]['preferred_days'])
+                violations.append(ConstraintViolation(
+                    "instructor_preference_day", ConstraintType.SOFT,
+                    20 * count,
+                    f"Instructor {iid} day preference: prefers {prefs} but scheduled on {sched} ({exams})",
+                ))
+
+            if mismatches['shift']:
+                count  = len(mismatches['shift'])
+                exams  = ', '.join(m['exam_name'] for m in mismatches['shift'])
+                sched  = ', '.join(m['scheduled_shift'] for m in mismatches['shift'])
+                prefs  = '/'.join(mismatches['shift'][0]['preferred_shifts'])
+                violations.append(ConstraintViolation(
+                    "instructor_preference_shift", ConstraintType.SOFT,
+                    20 * count,
+                    f"Instructor {iid} shift preference: prefers {prefs} but scheduled in {sched} ({exams})",
+                ))
+
         return violations
 
     # ── Main Evaluation ───────────────────────────────────────────────────────────

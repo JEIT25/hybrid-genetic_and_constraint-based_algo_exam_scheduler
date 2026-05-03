@@ -33,6 +33,10 @@ class GAConfig:
     stagnation_limit: int = 50        # restart if no improvement
     target_fitness: Optional[float] = None  # stop early if reached
     seed: Optional[int] = None
+    # When > 1.0 soft penalties are amplified so the GA actively optimises them
+    soft_weight: float = 1.0
+    # Number of repair-pass iterations per individual (default 50, raise for hard-fix mode)
+    max_repair_attempts: int = 50
 
     def to_dict(self):
         return asdict(self)
@@ -184,7 +188,18 @@ class ExamSchedulerGA:
     # ── 2. Fitness Evaluation ─────────────────────────────────────────────
 
     def _evaluate(self, schedule: Schedule) -> Tuple[float, List[ConstraintViolation]]:
-        return self.engine.evaluate(schedule)
+        _, violations = self.engine.evaluate(schedule)
+        if self.config.soft_weight != 1.0:
+            # Recompute fitness with amplified soft-constraint penalty so the
+            # GA actively pursues soft-constraint improvement, not just feasibility.
+            hard_p = sum(v.penalty for v in violations if v.constraint_type == ConstraintType.HARD)
+            soft_p = sum(v.penalty for v in violations if v.constraint_type == ConstraintType.SOFT)
+            fitness = 10_000_000 - hard_p - self.config.soft_weight * soft_p
+        else:
+            hard_p = sum(v.penalty for v in violations if v.constraint_type == ConstraintType.HARD)
+            soft_p = sum(v.penalty for v in violations if v.constraint_type == ConstraintType.SOFT)
+            fitness = 10_000_000 - hard_p - soft_p
+        return fitness, violations
 
     def _fitness(self, schedule: Schedule) -> float:
         key = id(schedule)
@@ -296,6 +311,79 @@ class ExamSchedulerGA:
 
         return schedule
 
+    # ── 5b. Soft-Targeted Mutation ────────────────────────────────────────
+    def _soft_targeted_mutate(self, schedule: Schedule) -> Schedule:
+        """
+        Deterministic instructor-preference repair pass.
+
+        For every exam whose instructor has day/shift preferences that the
+        current assignment violates, find the best conflict-free slot that
+        respects those preferences and swap unconditionally.
+
+        'Best' means: (1) preference satisfied, (2) room conflict-free,
+        (3) least wasted seats (smallest room that fits).
+
+        Moving from a non-preferred day/shift to a preferred one always
+        reduces the soft penalty, so no fitness comparison is needed —
+        the swap is beneficial by definition as long as no new hard
+        violations are introduced (guaranteed by the conflict check below).
+        """
+        schedule = list(schedule)
+
+        # Build a live room-time occupancy map so we can avoid room conflicts
+        # as we make successive swaps in this pass.
+        room_time: dict = {}   # (room_id, timeslot_id) -> exam_id
+        for a in schedule:
+            room_time[(a.room_id, a.timeslot_id)] = a.exam_id
+
+        for i, assignment in enumerate(schedule):
+            exam = self.exams.get(assignment.exam_id)
+            if not exam or not exam.instructor_prefs:
+                continue
+
+            ts       = self.timeslots[assignment.timeslot_id]
+            raw_days = exam.instructor_prefs.get('days', [])
+            pref_days   = [int(d) for d in raw_days if str(d).lstrip('-').isdigit()]
+            pref_shifts = exam.instructor_prefs.get('shifts', [])
+
+            day_ok   = (not pref_days)   or (ts.day in pref_days)
+            shift_ok = (not pref_shifts) or (ts.shift_name in pref_shifts)
+
+            if day_ok and shift_ok:
+                continue  # preference already satisfied — nothing to do
+
+            # Collect pairs that (a) satisfy the preference AND (b) have no
+            # room conflict with any other already-placed exam.
+            candidates = []
+            for (tid, rid) in self._feasible_pairs[assignment.exam_id]:
+                # Preference check
+                if pref_days and self.timeslots[tid].day not in pref_days:
+                    continue
+                if pref_shifts and self.timeslots[tid].shift_name not in pref_shifts:
+                    continue
+                # Room-conflict check: the slot is free or occupied only by this exam
+                occupant = room_time.get((rid, tid))
+                if occupant is not None and occupant != assignment.exam_id:
+                    continue
+                waste = self.rooms[rid].capacity - exam.student_count
+                candidates.append((waste, tid, rid))
+
+            if not candidates:
+                continue  # no conflict-free preferred slot exists — leave as is
+
+            # Pick slot with least room waste (tie-break: random among equals)
+            candidates.sort(key=lambda x: x[0])
+            best_waste = candidates[0][0]
+            best_candidates = [(t, r) for (w, t, r) in candidates if w == best_waste]
+            new_tid, new_rid = random.choice(best_candidates)
+
+            # Apply swap and update the live occupancy map
+            room_time.pop((assignment.room_id, assignment.timeslot_id), None)
+            room_time[(new_rid, new_tid)] = assignment.exam_id
+            schedule[i] = Assignment(assignment.exam_id, new_tid, new_rid)
+
+        return schedule
+
     # ── 6. Repair Operator ────────────────────────────────────────────────
 
     def _repair(self, schedule: Schedule) -> Schedule:
@@ -303,7 +391,7 @@ class ExamSchedulerGA:
         Attempt to fix hard-constraint violations by re-assigning offending exams.
         This is the key 'constraint-based' part of the hybrid.
         """
-        max_attempts = 50
+        max_attempts = self.config.max_repair_attempts
         for attempt in range(max_attempts):
             _, violations = self._evaluate(schedule)
             hard = [v for v in violations if v.constraint_type == ConstraintType.HARD]
@@ -447,8 +535,14 @@ class ExamSchedulerGA:
 
             # Local search on top individuals
             ls_n = max(1, int(len(pop_fitness) * self.config.local_search_ratio))
+            best_is_feasible = (hard_v == 0)
             for i in range(min(ls_n, elite_n)):
                 next_pop[i] = self._targeted_mutate(next_pop[i])
+                # When the best schedule is already feasible and we're in
+                # soft-optimise mode, spend local-search effort on instructor
+                # preferences instead of (unnecessary) hard-constraint repair.
+                if best_is_feasible and self.config.soft_weight > 1.0:
+                    next_pop[i] = self._soft_targeted_mutate(next_pop[i])
                 next_pop[i] = self._local_search(next_pop[i])
 
             # Fill rest via crossover + mutation
@@ -458,9 +552,13 @@ class ExamSchedulerGA:
                 c1, c2 = self._crossover(p1, p2)
                 c1 = self._mutate(c1)
                 c2 = self._mutate(c2)
-                # Targeted mutation to directly address hard violations
+                # Hard-constraint targeted mutation
                 c1 = self._targeted_mutate(c1)
                 c2 = self._targeted_mutate(c2)
+                # Soft-constraint targeted mutation (only in soft-optimise mode)
+                if best_is_feasible and self.config.soft_weight > 1.0:
+                    c1 = self._soft_targeted_mutate(c1)
+                    c2 = self._soft_targeted_mutate(c2)
                 c1 = self._repair(c1)
                 c2 = self._repair(c2)
                 next_pop.append(c1)
