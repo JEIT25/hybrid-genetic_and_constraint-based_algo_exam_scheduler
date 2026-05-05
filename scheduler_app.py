@@ -200,6 +200,20 @@ def run_scheduler_job(job_id, exams, rooms, timeslots, config):
 
 # ─── API Endpoints ────────────────────────────────────────────────────────────
 
+@app.route("/", methods=["GET"])
+def root():
+    """Helps verify the correct app is bound to the port (avoid silent wrong-process 404s)."""
+    return jsonify({
+        "service": "exam-scheduler-ga",
+        "status": "ok",
+        "endpoints": {
+            "GET /api/health": "liveness",
+            "POST /api/schedule/sync": "synchronous schedule (Laravel)",
+            "POST /api/schedule": "async schedule",
+        },
+    })
+
+
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "exam-scheduler-ga"})
@@ -329,4 +343,10 @@ def create_schedule_sync():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    # Default: single process (use_reloader=False). Debug mode with reloader=True spawns an extra
+    # Python parent process — netstat often shows two PIDs on :5000 and restarts can briefly serve stale code.
+    # Enable hot-reload: set SCHEDULER_USE_RELOADER=1 in the environment.
+    import os
+
+    _reload = os.environ.get("SCHEDULER_USE_RELOADER", "").strip().lower() in ("1", "true", "yes", "on")
+    app.run(debug=True, host="0.0.0.0", port=5000, use_reloader=_reload)
