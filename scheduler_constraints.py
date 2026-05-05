@@ -197,6 +197,14 @@ class ConstraintEngine:
         for room_id, assignments in room_time.items():
             for i in range(len(assignments)):
                 for j in range(i + 1, len(assignments)):
+                    exam_i = self.exams[assignments[i].exam_id]
+                    exam_j = self.exams[assignments[j].exam_id]
+                    # Sections of one subject share a timeslot (HC6) but must use different rooms.
+                    # Pairwise room overlap for same group_id is handled by _check_section_distinct_rooms.
+                    gid_i = exam_i.group_id or ""
+                    gid_j = exam_j.group_id or ""
+                    if gid_i and gid_i == gid_j:
+                        continue
                     ts_i = self.timeslots[assignments[i].timeslot_id]
                     ts_j = self.timeslots[assignments[j].timeslot_id]
                     if ts_i.overlaps(ts_j):
@@ -325,12 +333,15 @@ class ConstraintEngine:
                 ))
         return violations
 
-    # ── Soft Constraints ──────────────────────────────────────────────────
-
-    def _check_section_different_rooms(self, schedule):
+    def _check_section_distinct_rooms(self, schedule):
         """
-        SC: Sections of the same subject SHOULD be in different rooms.
-        If two sections share the same room and timeslot, penalize lightly.
+        HC (same subject): Each section exam must use a different room.
+        Paired with HC6 (shared timeslot), this implies no two sections sit in the
+        same room at once. When section count exceeds available rooms of the needed
+        type, this constraint cannot be satisfied — same as physical limits.
+
+        Room overlap between sections of the same group_id is excluded from
+        _check_room_clash so this rule is the single source of truth for that case.
         """
         violations = []
         exam_assignment = {a.exam_id: a for a in schedule}
@@ -342,16 +353,18 @@ class ConstraintEngine:
             for eid in eids:
                 if eid in exam_assignment:
                     rooms_used.append(exam_assignment[eid].room_id)
-            # Check for duplicate rooms within same group
             if len(rooms_used) != len(set(rooms_used)):
                 duplicates = len(rooms_used) - len(set(rooms_used))
                 violations.append(ConstraintViolation(
-                    "section_same_room", ConstraintType.SOFT,
-                    30 * duplicates,
-                    f"Group {gid}: {duplicates} section pair(s) share the same room",
+                    "section_same_room", ConstraintType.HARD,
+                    self.HARD_PENALTY * max(1, duplicates),
+                    f"Group {gid}: same-subject sections must use distinct rooms "
+                    f"({duplicates} duplicate room assignment(s))",
                     exam_ids=eids,
                 ))
         return violations
+
+    # ── Soft Constraints ──────────────────────────────────────────────────
 
     def _check_consecutive_exams(self, schedule):
         """Emit one violation per student who has back-to-back exams."""
@@ -513,13 +526,13 @@ class ConstraintEngine:
         all_violations.extend(self._check_exam_room_type_match(schedule))
         all_violations.extend(self._check_instructor_clash(schedule))
         all_violations.extend(self._check_section_same_timeslot(schedule))
+        all_violations.extend(self._check_section_distinct_rooms(schedule))
 
         # Soft
         all_violations.extend(self._check_consecutive_exams(schedule))
         all_violations.extend(self._check_spread(schedule))
         all_violations.extend(self._check_room_utilization(schedule))
         all_violations.extend(self._check_instructor_preferences(schedule))
-        all_violations.extend(self._check_section_different_rooms(schedule))
 
         total_penalty = sum(v.penalty for v in all_violations)
         fitness = 10_000_000 - total_penalty
