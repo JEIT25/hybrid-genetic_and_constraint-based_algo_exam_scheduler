@@ -10,13 +10,37 @@ The "hybrid" means:
 import random
 import copy
 import time
+from multiprocessing import Pool, cpu_count
 from typing import List, Dict, Tuple, Optional, Callable
 from dataclasses import dataclass, field, asdict
-from concurrent.futures import ThreadPoolExecutor
 from scheduler_constraints import (
     Exam, Room, Timeslot, Assignment, Schedule,
     ConstraintEngine, ConstraintViolation, ConstraintType,
 )
+
+
+def fitness_from_violations(violations: List[ConstraintViolation], soft_weight: float) -> float:
+    """Same scoring as ExamSchedulerGA._evaluate (kept in one place for parallel workers)."""
+    hard_p = sum(v.penalty for v in violations if v.constraint_type == ConstraintType.HARD)
+    soft_p = sum(v.penalty for v in violations if v.constraint_type == ConstraintType.SOFT)
+    return 10_000_000 - hard_p - float(soft_weight) * soft_p
+
+
+_worker_engine: Optional[ConstraintEngine] = None
+_worker_soft_weight: float = 1.0
+
+
+def _parallel_worker_init(exams: Dict[str, Exam], rooms: Dict[str, Room], timeslots: Dict[str, Timeslot], soft_weight: float):
+    global _worker_engine, _worker_soft_weight
+    _worker_engine = ConstraintEngine(exams, rooms, timeslots)
+    _worker_soft_weight = float(soft_weight)
+
+
+def _parallel_fitness(schedule: Schedule) -> float:
+    global _worker_engine, _worker_soft_weight
+    assert _worker_engine is not None
+    _, violations = _worker_engine.evaluate(schedule)
+    return fitness_from_violations(violations, _worker_soft_weight)
 
 
 @dataclass
@@ -37,6 +61,10 @@ class GAConfig:
     soft_weight: float = 1.0
     # Number of repair-pass iterations per individual (default 50, raise for hard-fix mode)
     max_repair_attempts: int = 50
+    # Parallel fitness evaluation (multiprocessing). 0 = auto when len(exams)>=22 and cpu_count>1; 1 = off.
+    parallel_eval_workers: int = 0
+    # If > 0: stop when best individual is feasible (no hard violations) and fitness has not improved for this many generations.
+    early_exit_feasible_stagnation: int = 0
 
     def to_dict(self):
         return asdict(self)
@@ -122,16 +150,29 @@ class ExamSchedulerGA:
         self._best_ever: Optional[Tuple[float, Schedule]] = None
         self._callback: Optional[Callable] = None
 
+    def _parallel_worker_count(self) -> int:
+        w = self.config.parallel_eval_workers
+        cores = cpu_count() or 2
+        if w == 1:
+            return 1
+        if w >= 2:
+            return max(1, min(w, cores))
+        # auto (w == 0)
+        if len(self.exams) < 22 or cores < 2:
+            return 1
+        return max(1, cores - 1)
+
     # ── 1. Constraint-Propagation Seeding ─────────────────────────────────
 
     def _seed_individual(self) -> Schedule:
         """
-        Build one schedule using greedy constraint propagation:
-        - Sort exams by difficulty (most constrained first)
-        - For each exam, pick a (timeslot, room) that causes fewest conflicts
+        Build one schedule using greedy constraint propagation.
+        Assigns all sections of a group together to respect section constraints.
         """
         schedule: List[Assignment] = []
         used_slots: Dict[str, Dict[str, str]] = {}  # timeslot_id → {room_id: exam_id}
+
+        scheduled_eids = set()
 
         # Most-constrained-first: more conflicts + fewer feasible options = harder
         sorted_exams = sorted(
@@ -142,40 +183,95 @@ class ExamSchedulerGA:
             ),
         )
 
-        for eid in sorted_exams:
-            candidates = self._feasible_pairs[eid]
-            random.shuffle(candidates)
+        for base_eid in sorted_exams:
+            if base_eid in scheduled_eids:
+                continue
 
-            best_pair = None
+            exam = self.exams[base_eid]
+            group_eids = self.engine.group_map.get(exam.group_id, [base_eid]) if exam.group_id else [base_eid]
+
+            tids = list(set(tid for tid, rid in self._feasible_pairs[base_eid]))
+            random.shuffle(tids)
+
+            best_assignments = None
             best_score = float("inf")
 
             # Sample up to 30 candidates for speed
-            for tid, rid in candidates[:30]:
+            for tid in tids[:30]:
                 score = 0
-                # Room already taken in this slot?
-                if tid in used_slots and rid in used_slots[tid]:
-                    score += 10000
-                # Student clash?
-                for existing in schedule:
-                    if self.timeslots[existing.timeslot_id].overlaps(self.timeslots[tid]):
-                        if existing.exam_id in self.engine.conflict_graph.get(eid, set()):
-                            score += 10000
+                temp_assignments = {}
+                temp_rooms = set()
+                success = True
 
-                # Soft: room waste
-                room = self.rooms[rid]
-                exam = self.exams[eid]
-                score += (room.capacity - exam.student_count) * 0.1
+                for geid in group_eids:
+                    valid_rids = [r for t, r in self._feasible_pairs[geid] if t == tid and r not in temp_rooms]
+                    if not valid_rids:
+                        success = False
+                        break
 
-                if score < best_score:
+                    best_r_score = float("inf")
+                    best_rid = None
+                    for rid in valid_rids[:10]:
+                        r_score = 0
+                        # Room already taken in this slot?
+                        if tid in used_slots and rid in used_slots[tid]:
+                            r_score += 10000
+                        # Student clash?
+                        for existing in schedule:
+                            if self.timeslots[existing.timeslot_id].overlaps(self.timeslots[tid]):
+                                if existing.exam_id in self.engine.conflict_graph.get(geid, set()):
+                                    r_score += 10000
+
+                        # Soft: room waste
+                        r_score += (self.rooms[rid].capacity - self.exams[geid].student_count) * 0.1
+
+                        if r_score < best_r_score:
+                            best_r_score = r_score
+                            best_rid = rid
+
+                    if best_rid is None:
+                        success = False
+                        break
+
+                    temp_rooms.add(best_rid)
+                    temp_assignments[geid] = best_rid
+                    score += best_r_score
+
+                if success and score < best_score:
                     best_score = score
-                    best_pair = (tid, rid)
+                    best_assignments = (tid, temp_assignments)
 
-            if best_pair is None:
-                best_pair = random.choice(candidates)
+            if best_assignments is None:
+                # Fallback: Just pick any valid combination regardless of conflicts
+                for tid in tids:
+                    temp_assignments = {}
+                    temp_rooms = set()
+                    success = True
+                    for geid in group_eids:
+                        valid_rids = [r for t, r in self._feasible_pairs[geid] if t == tid and r not in temp_rooms]
+                        if not valid_rids:
+                            success = False
+                            break
+                        rid = random.choice(valid_rids)
+                        temp_rooms.add(rid)
+                        temp_assignments[geid] = rid
+                    if success:
+                        best_assignments = (tid, temp_assignments)
+                        break
 
-            tid, rid = best_pair
-            schedule.append(Assignment(exam_id=eid, timeslot_id=tid, room_id=rid))
-            used_slots.setdefault(tid, {})[rid] = eid
+            if best_assignments:
+                tid, assigns = best_assignments
+                for geid, rid in assigns.items():
+                    schedule.append(Assignment(exam_id=geid, timeslot_id=tid, room_id=rid))
+                    used_slots.setdefault(tid, {})[rid] = geid
+                    scheduled_eids.add(geid)
+            else:
+                # Absolute fallback (rare, unless severely constrained rooms)
+                for geid in group_eids:
+                    tid, rid = random.choice(self._feasible_pairs[geid])
+                    schedule.append(Assignment(exam_id=geid, timeslot_id=tid, room_id=rid))
+                    used_slots.setdefault(tid, {})[rid] = geid
+                    scheduled_eids.add(geid)
 
         return schedule
 
@@ -189,16 +285,7 @@ class ExamSchedulerGA:
 
     def _evaluate(self, schedule: Schedule) -> Tuple[float, List[ConstraintViolation]]:
         _, violations = self.engine.evaluate(schedule)
-        if self.config.soft_weight != 1.0:
-            # Recompute fitness with amplified soft-constraint penalty so the
-            # GA actively pursues soft-constraint improvement, not just feasibility.
-            hard_p = sum(v.penalty for v in violations if v.constraint_type == ConstraintType.HARD)
-            soft_p = sum(v.penalty for v in violations if v.constraint_type == ConstraintType.SOFT)
-            fitness = 10_000_000 - hard_p - self.config.soft_weight * soft_p
-        else:
-            hard_p = sum(v.penalty for v in violations if v.constraint_type == ConstraintType.HARD)
-            soft_p = sum(v.penalty for v in violations if v.constraint_type == ConstraintType.SOFT)
-            fitness = 10_000_000 - hard_p - soft_p
+        fitness = fitness_from_violations(violations, float(self.config.soft_weight))
         return fitness, violations
 
     def _fitness(self, schedule: Schedule) -> float:
@@ -472,100 +559,126 @@ class ExamSchedulerGA:
         stagnation_counter = 0
         best_fitness_ever = float("-inf")
 
-        for gen in range(self.config.max_generations):
-            self.fitness_cache.clear()
-
-            # Evaluate all
-            pop_fitness = [(ind, self._fitness(ind)) for ind in self.population]
-            pop_fitness.sort(key=lambda x: x[1], reverse=True)
-
-            best_f = pop_fitness[0][1]
-            avg_f = sum(f for _, f in pop_fitness) / len(pop_fitness)
-            worst_f = pop_fitness[-1][1]
-
-            # Track best ever
-            if best_f > best_fitness_ever:
-                best_fitness_ever = best_f
-                self._best_ever = (best_f, copy.deepcopy(pop_fitness[0][0]))
-                stagnation_counter = 0
-            else:
-                stagnation_counter += 1
-
-            # Stats
-            _, all_v = self._evaluate(pop_fitness[0][0])
-            hard_v = sum(1 for v in all_v if v.constraint_type == ConstraintType.HARD)
-            soft_v = sum(1 for v in all_v if v.constraint_type == ConstraintType.SOFT)
-            feasible_count = sum(1 for ind, _ in pop_fitness if self.engine.is_feasible(ind))
-
-            stats = EvolutionStats(
-                generation=gen,
-                best_fitness=best_f,
-                avg_fitness=avg_f,
-                worst_fitness=worst_f,
-                hard_violations=hard_v,
-                soft_violations=soft_v,
-                feasible_pct=feasible_count / len(pop_fitness) * 100,
-                elapsed_sec=time.time() - start_time,
+        workers = self._parallel_worker_count()
+        eval_pool: Optional[Pool] = None
+        if workers > 1:
+            eval_pool = Pool(
+                processes=workers,
+                initializer=_parallel_worker_init,
+                initargs=(self.exams, self.rooms, self.timeslots, float(self.config.soft_weight)),
             )
-            self.history.append(stats)
 
-            if callback:
-                callback(stats)
+        try:
+            for gen in range(self.config.max_generations):
+                self.fitness_cache.clear()
 
-            # Early stopping
-            if self.config.target_fitness and best_f >= self.config.target_fitness:
-                break
-            if stagnation_counter >= self.config.stagnation_limit:
-                # Restart: keep elite, re-seed the rest
-                elite_n = max(2, int(len(pop_fitness) * self.config.elite_ratio))
-                elite = [copy.deepcopy(ind) for ind, _ in pop_fitness[:elite_n]]
-                new_pop = elite + [self._seed_individual() for _ in range(len(pop_fitness) - elite_n)]
-                self.population = new_pop
-                stagnation_counter = 0
-                continue
+                # Evaluate population (multiprocessing avoids GIL for CPU-heavy constraint checks)
+                if eval_pool is not None:
+                    chunk = max(1, len(self.population) // (workers * 4))
+                    fitness_values = eval_pool.map(_parallel_fitness, self.population, chunksize=chunk)
+                    pop_fitness = list(zip(self.population, fitness_values))
+                else:
+                    pop_fitness = [(ind, self._fitness(ind)) for ind in self.population]
+                pop_fitness.sort(key=lambda x: x[1], reverse=True)
 
-            # ── Build next generation ────────────────────────────────
+                best_f = pop_fitness[0][1]
+                avg_f = sum(f for _, f in pop_fitness) / len(pop_fitness)
+                worst_f = pop_fitness[-1][1]
 
-            next_pop: List[Schedule] = []
+                # Track best ever
+                if best_f > best_fitness_ever:
+                    best_fitness_ever = best_f
+                    self._best_ever = (best_f, copy.deepcopy(pop_fitness[0][0]))
+                    stagnation_counter = 0
+                else:
+                    stagnation_counter += 1
 
-            # Elitism
-            elite_n = max(1, int(len(pop_fitness) * self.config.elite_ratio))
-            for ind, _ in pop_fitness[:elite_n]:
-                next_pop.append(copy.deepcopy(ind))
+                # Stats
+                _, all_v = self._evaluate(pop_fitness[0][0])
+                hard_v = sum(1 for v in all_v if v.constraint_type == ConstraintType.HARD)
+                soft_v = sum(1 for v in all_v if v.constraint_type == ConstraintType.SOFT)
+                feasible_count = sum(1 for ind, _ in pop_fitness if self.engine.is_feasible(ind))
 
-            # Local search on top individuals
-            ls_n = max(1, int(len(pop_fitness) * self.config.local_search_ratio))
-            best_is_feasible = (hard_v == 0)
-            for i in range(min(ls_n, elite_n)):
-                next_pop[i] = self._targeted_mutate(next_pop[i])
-                # When the best schedule is already feasible and we're in
-                # soft-optimise mode, spend local-search effort on instructor
-                # preferences instead of (unnecessary) hard-constraint repair.
-                if best_is_feasible and self.config.soft_weight > 1.0:
-                    next_pop[i] = self._soft_targeted_mutate(next_pop[i])
-                next_pop[i] = self._local_search(next_pop[i])
+                stats = EvolutionStats(
+                    generation=gen,
+                    best_fitness=best_f,
+                    avg_fitness=avg_f,
+                    worst_fitness=worst_f,
+                    hard_violations=hard_v,
+                    soft_violations=soft_v,
+                    feasible_pct=feasible_count / len(pop_fitness) * 100,
+                    elapsed_sec=time.time() - start_time,
+                )
+                self.history.append(stats)
 
-            # Fill rest via crossover + mutation
-            while len(next_pop) < self.config.population_size:
-                p1 = self._tournament_select(pop_fitness)
-                p2 = self._tournament_select(pop_fitness)
-                c1, c2 = self._crossover(p1, p2)
-                c1 = self._mutate(c1)
-                c2 = self._mutate(c2)
-                # Hard-constraint targeted mutation
-                c1 = self._targeted_mutate(c1)
-                c2 = self._targeted_mutate(c2)
-                # Soft-constraint targeted mutation (only in soft-optimise mode)
-                if best_is_feasible and self.config.soft_weight > 1.0:
-                    c1 = self._soft_targeted_mutate(c1)
-                    c2 = self._soft_targeted_mutate(c2)
-                c1 = self._repair(c1)
-                c2 = self._repair(c2)
-                next_pop.append(c1)
-                if len(next_pop) < self.config.population_size:
-                    next_pop.append(c2)
+                if callback:
+                    callback(stats)
 
-            self.population = next_pop
+                # Early stopping
+                if self.config.target_fitness and best_f >= self.config.target_fitness:
+                    break
+                if (
+                    self.config.early_exit_feasible_stagnation > 0
+                    and hard_v == 0
+                    and stagnation_counter >= self.config.early_exit_feasible_stagnation
+                ):
+                    break
+                if stagnation_counter >= self.config.stagnation_limit:
+                    # Restart: keep elite, re-seed the rest
+                    elite_n = max(2, int(len(pop_fitness) * self.config.elite_ratio))
+                    elite = [copy.deepcopy(ind) for ind, _ in pop_fitness[:elite_n]]
+                    new_pop = elite + [self._seed_individual() for _ in range(len(pop_fitness) - elite_n)]
+                    self.population = new_pop
+                    stagnation_counter = 0
+                    continue
+
+                # ── Build next generation ────────────────────────────────
+
+                next_pop: List[Schedule] = []
+
+                # Elitism
+                elite_n = max(1, int(len(pop_fitness) * self.config.elite_ratio))
+                for ind, _ in pop_fitness[:elite_n]:
+                    next_pop.append(copy.deepcopy(ind))
+
+                # Local search on top individuals
+                ls_n = max(1, int(len(pop_fitness) * self.config.local_search_ratio))
+                best_is_feasible = (hard_v == 0)
+                for i in range(min(ls_n, elite_n)):
+                    next_pop[i] = self._targeted_mutate(next_pop[i])
+                    # When the best schedule is already feasible and we're in
+                    # soft-optimise mode, spend local-search effort on instructor
+                    # preferences instead of (unnecessary) hard-constraint repair.
+                    if best_is_feasible and self.config.soft_weight > 1.0:
+                        next_pop[i] = self._soft_targeted_mutate(next_pop[i])
+                    next_pop[i] = self._local_search(next_pop[i])
+
+                # Fill rest via crossover + mutation
+                while len(next_pop) < self.config.population_size:
+                    p1 = self._tournament_select(pop_fitness)
+                    p2 = self._tournament_select(pop_fitness)
+                    c1, c2 = self._crossover(p1, p2)
+                    c1 = self._mutate(c1)
+                    c2 = self._mutate(c2)
+                    # Hard-constraint targeted mutation
+                    c1 = self._targeted_mutate(c1)
+                    c2 = self._targeted_mutate(c2)
+                    # Soft-constraint targeted mutation (only in soft-optimise mode)
+                    if best_is_feasible and self.config.soft_weight > 1.0:
+                        c1 = self._soft_targeted_mutate(c1)
+                        c2 = self._soft_targeted_mutate(c2)
+                    c1 = self._repair(c1)
+                    c2 = self._repair(c2)
+                    next_pop.append(c1)
+                    if len(next_pop) < self.config.population_size:
+                        next_pop.append(c2)
+
+                self.population = next_pop
+
+        finally:
+            if eval_pool is not None:
+                eval_pool.close()
+                eval_pool.join()
 
         # Return best ever found
         if self._best_ever:

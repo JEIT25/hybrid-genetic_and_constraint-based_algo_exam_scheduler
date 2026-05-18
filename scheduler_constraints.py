@@ -156,36 +156,25 @@ class ConstraintEngine:
 
     def _check_student_clash(self, schedule):
         violations = []
-        slot_map = {}
-        for a in schedule:
-            slot_map.setdefault(a.timeslot_id, []).append(a.exam_id)
-
-        checked = set()
-        for ts_id1, exams1 in slot_map.items():
-            for ts_id2, exams2 in slot_map.items():
-                pair = tuple(sorted([ts_id1, ts_id2]))
-                if pair in checked:
-                    continue
-                checked.add(pair)
-                ts1 = self.timeslots[ts_id1]
-                ts2 = self.timeslots[ts_id2]
-                if not ts1.overlaps(ts2):
-                    continue
-                for e1 in exams1:
-                    for e2 in exams2:
-                        if e1 >= e2:
-                            continue
-                        if e2 in self.conflict_graph.get(e1, set()):
-                            shared = len(
-                                self.exams[e1].enrolled_students
-                                & self.exams[e2].enrolled_students
-                            )
-                            violations.append(ConstraintViolation(
-                                "student_clash", ConstraintType.HARD,
-                                self.HARD_PENALTY * shared,
-                                f"Exams {e1} & {e2} clash ({shared} students)",
-                                exam_ids=[e1, e2],
-                            ))
+        exam_ts = {a.exam_id: self.timeslots[a.timeslot_id] for a in schedule}
+        
+        for e1, conflicts in self.conflict_graph.items():
+            ts1 = exam_ts.get(e1)
+            if not ts1: continue
+            
+            for e2 in conflicts:
+                if e1 >= e2: continue
+                ts2 = exam_ts.get(e2)
+                if not ts2: continue
+                
+                if ts1.overlaps(ts2):
+                    shared = len(self.exams[e1].enrolled_students & self.exams[e2].enrolled_students)
+                    violations.append(ConstraintViolation(
+                        "student_clash", ConstraintType.HARD,
+                        self.HARD_PENALTY * shared,
+                        f"Exams {e1} & {e2} clash ({shared} students)",
+                        exam_ids=[e1, e2],
+                    ))
         return violations
 
     def _check_room_clash(self, schedule):
@@ -369,23 +358,37 @@ class ConstraintEngine:
     def _check_consecutive_exams(self, schedule):
         """Emit one violation per student who has back-to-back exams."""
         violations = []
-        student_schedule = {}
-        for a in schedule:
-            exam = self.exams[a.exam_id]
-            ts = self.timeslots[a.timeslot_id]
-            for sid in exam.enrolled_students:
-                student_schedule.setdefault(sid, []).append((a.exam_id, exam.name, ts))
-
-        for sid, entries in student_schedule.items():
-            entries.sort(key=lambda x: (x[2].day, x[2].start_hour, x[2].start_minute))
-            for i in range(len(entries) - 1):
-                if entries[i][2].is_consecutive(entries[i + 1][2]):
-                    e1, e2 = entries[i][1], entries[i + 1][1]
-                    violations.append(ConstraintViolation(
-                        "consecutive_exams_detail", ConstraintType.SOFT,
-                        50,
-                        f"Student #{sid} has back-to-back exams: {e1} then {e2} with no break",
-                    ))
+        exam_ts = {a.exam_id: self.timeslots[a.timeslot_id] for a in schedule}
+        
+        for e1, conflicts in self.conflict_graph.items():
+            ts1 = exam_ts.get(e1)
+            if not ts1: continue
+            
+            for e2 in conflicts:
+                if e1 >= e2: continue
+                ts2 = exam_ts.get(e2)
+                if not ts2: continue
+                
+                if ts1.is_consecutive(ts2):
+                    shared = self.exams[e1].enrolled_students & self.exams[e2].enrolled_students
+                    if not shared: continue
+                    
+                    # Determine order for output (purely cosmetic)
+                    # We want the earlier exam first in the message
+                    s1 = ts1.start_hour * 60 + ts1.start_minute
+                    s2 = ts2.start_hour * 60 + ts2.start_minute
+                    
+                    if s1 <= s2:
+                        first_exam, second_exam = self.exams[e1].name, self.exams[e2].name
+                    else:
+                        first_exam, second_exam = self.exams[e2].name, self.exams[e1].name
+                        
+                    for sid in shared:
+                        violations.append(ConstraintViolation(
+                            "consecutive_exams_detail", ConstraintType.SOFT,
+                            50,
+                            f"Student #{sid} has back-to-back exams: {first_exam} then {second_exam} with no break",
+                        ))
         return violations
 
     def _check_spread(self, schedule):

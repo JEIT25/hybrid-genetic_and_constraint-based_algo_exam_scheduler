@@ -248,6 +248,11 @@ def create_schedule():
         stagnation_limit=cfg_data.get("stagnation_limit", 50),
         seed=cfg_data.get("seed", None),
         soft_weight=float(cfg_data.get("soft_weight", 1.0)),
+        max_repair_attempts=int(cfg_data.get("max_repair_attempts", 50)),
+        parallel_eval_workers=int(cfg_data.get("parallel_eval_workers", 0)),
+        early_exit_feasible_stagnation=int(cfg_data.get("early_exit_feasible_stagnation", 0)),
+        local_search_steps=int(cfg_data.get("local_search_steps", 20)),
+        local_search_ratio=float(cfg_data.get("local_search_ratio", 0.05)),
     )
 
     job_id = str(uuid.uuid4())
@@ -304,6 +309,10 @@ def create_schedule_sync():
         seed=cfg_data.get("seed", None),
         soft_weight=float(cfg_data.get("soft_weight", 1.0)),
         max_repair_attempts=int(cfg_data.get("max_repair_attempts", 50)),
+        parallel_eval_workers=int(cfg_data.get("parallel_eval_workers", 0)),
+        early_exit_feasible_stagnation=int(cfg_data.get("early_exit_feasible_stagnation", 0)),
+        local_search_steps=int(cfg_data.get("local_search_steps", 20)),
+        local_search_ratio=float(cfg_data.get("local_search_ratio", 0.05)),
     )
 
     try:
